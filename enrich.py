@@ -198,12 +198,24 @@ SOCIAL_FIELDS = ("facebook", "instagram", "linkedin", "twitter",
                  "youtube", "tiktok", "pinterest", "whatsapp", "telegram")
 
 
-def _apply_enrichment(place: dict, enrichment: dict) -> dict:
-    """Merge an enrichment payload into a place dict (in-place safe copy)."""
-    place["emails"] = enrichment.get("emails", []) or []
+def _apply_enrichment(
+    place: dict,
+    enrichment: dict,
+    channels: dict[str, bool] | None = None,
+) -> dict:
+    """Merge an enrichment payload into a place dict.
+
+    channels controls which fields are written. Keys: 'email' and any social
+    name from SOCIAL_FIELDS. If channels is None, all fields are written
+    (legacy behavior).
+    """
+    write_all = channels is None
+    if write_all or channels.get("email"):
+        place["emails"] = enrichment.get("emails", []) or []
     socials = enrichment.get("socials", {}) or {}
     for field in SOCIAL_FIELDS:
-        place[field] = socials.get(field, [])
+        if write_all or channels.get(field):
+            place[field] = socials.get(field, [])
     return place
 
 
@@ -211,20 +223,31 @@ def enrich_places_batch(
     places: list[dict],
     max_workers: int = 5,
     max_pages_per_site: int = 3,
+    channels: dict[str, bool] | None = None,
     progress_cb=None,
 ) -> Iterator[tuple[int, dict]]:
     """Enrich a list of places in parallel.
 
-    Yields (index, enriched_place) tuples as each finishes, so the caller
-    can update the UI progressively. Places without a website are yielded
-    immediately (with empty enrichment fields).
+    channels selects which fields to populate. Example:
+        channels = {"email": True, "instagram": True}
+    Other social fields are NOT seeded or written. If channels is None, all
+    enrichment fields are written (legacy behavior).
 
+    Yields (index, enriched_place) tuples as each finishes.
     progress_cb(done, total) is called after each completion.
     """
-    # Pre-seed enrichment fields so the dataframe has stable columns.
+    write_all = channels is None
+    enabled_socials = [
+        f for f in SOCIAL_FIELDS if write_all or channels.get(f)
+    ]
+    seed_email = write_all or channels.get("email")
+
+    # Pre-seed only the enabled fields so the dataframe has stable columns
+    # without polluting the output with unrequested channels.
     for p in places:
-        p.setdefault("emails", [])
-        for f in SOCIAL_FIELDS:
+        if seed_email:
+            p.setdefault("emails", [])
+        for f in enabled_socials:
             p.setdefault(f, [])
 
     todo: list[tuple[int, str]] = []
@@ -256,7 +279,7 @@ def enrich_places_batch(
             except Exception as e:
                 places[idx]["enrichment_error"] = str(e)
                 enrichment = {"emails": [], "socials": {}}
-            _apply_enrichment(places[idx], enrichment)
+            _apply_enrichment(places[idx], enrichment, channels)
             done += 1
             if progress_cb:
                 progress_cb(done, total)

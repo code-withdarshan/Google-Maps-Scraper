@@ -394,6 +394,23 @@ with st.sidebar:
         "🌐 Enrich with emails + social media",
         value=True,
     )
+    st.caption("Pick which channels to scrape:")
+    scrape_email = st.checkbox(
+        "📧 Email",
+        value=True,
+        disabled=not enrich_websites,
+        help="Extract emails from each business's website.",
+    )
+    scrape_instagram = st.checkbox(
+        "📷 Instagram",
+        value=True,
+        disabled=not enrich_websites,
+        help="Extract Instagram profile links from each business's website.",
+    )
+    if enrich_websites and not (scrape_email or scrape_instagram):
+        st.warning(
+            "Phase 2 will be skipped — tick at least one of Email or Instagram."
+        )
     enrich_workers = st.slider(
         "Parallel website fetches",
         min_value=1,
@@ -409,6 +426,12 @@ with st.sidebar:
         value=3,
         disabled=not enrich_websites,
     )
+
+    # Build the channels dict the enricher consumes.
+    enrich_channels = {
+        "email": bool(scrape_email),
+        "instagram": bool(scrape_instagram),
+    }
 
     st.markdown("---")
     run = st.button("▶️ Start scraping", type="primary", use_container_width=True)
@@ -469,10 +492,17 @@ if run:
     st.session_state.phase1_done = True
 
     # ---- Phase 2 -----------------------------------------------------------
-    if enrich_websites and results:
+    any_channel = any(enrich_channels.values())
+    if enrich_websites and results and any_channel:
         with_site = sum(1 for r in results if r.get("website"))
+        channels_label = ", ".join(
+            name.capitalize() for name, on in enrich_channels.items() if on
+        )
         st.markdown("### Phase 2 — Enriching websites")
-        st.caption(f"{with_site} of {len(results)} places have a website to enrich.")
+        st.caption(
+            f"{with_site} of {len(results)} places have a website to enrich. "
+            f"Channels: **{channels_label}**."
+        )
 
         phase2_status = st.empty()
         phase2_bar = st.progress(0.0)
@@ -488,6 +518,7 @@ if run:
                 results,
                 max_workers=enrich_workers,
                 max_pages_per_site=enrich_pages,
+                channels=enrich_channels,
                 progress_cb=progress,
             ):
                 # Update live table every few rows to avoid render churn.
