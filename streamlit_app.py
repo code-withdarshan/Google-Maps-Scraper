@@ -83,6 +83,36 @@ SORT_KEYS = {
 }
 
 
+def filter_by_channels(
+    rows: list[dict],
+    channels: dict[str, bool] | None,
+) -> tuple[list[dict], int]:
+    """Keep only rows that have every channel the user explicitly selected.
+
+    channels=None (legacy "scrape everything") => no filtering.
+    Otherwise: a row must satisfy ALL active channel checks to be kept.
+    """
+    if not channels:
+        return rows, 0
+    active = [k for k, v in channels.items() if v]
+    if not active:
+        return rows, 0
+
+    def passes(r: dict) -> bool:
+        for ch in active:
+            if ch == "email":
+                if not _has_email(r):
+                    return False
+            else:
+                # Any social field name (instagram, facebook, ...).
+                if not _has(r, ch):
+                    return False
+        return True
+
+    kept = [r for r in rows if passes(r)]
+    return kept, len(rows) - len(kept)
+
+
 def apply_sort(
     rows: list[dict],
     primary_key: str,
@@ -394,23 +424,24 @@ with st.sidebar:
         "🌐 Enrich with emails + social media",
         value=True,
     )
-    st.caption("Pick which channels to scrape:")
+    st.caption(
+        "Pick channels to narrow scraping. **Leave both unchecked to get "
+        "every channel** (email + all social media)."
+    )
     scrape_email = st.checkbox(
-        "📧 Email",
-        value=True,
+        "📧 Email only",
+        value=False,
         disabled=not enrich_websites,
-        help="Extract emails from each business's website.",
+        help="If checked alone, only emails are scraped.",
     )
     scrape_instagram = st.checkbox(
-        "📷 Instagram",
-        value=True,
+        "📷 Instagram only",
+        value=False,
         disabled=not enrich_websites,
-        help="Extract Instagram profile links from each business's website.",
+        help="If checked alone, only Instagram links are scraped.",
     )
     if enrich_websites and not (scrape_email or scrape_instagram):
-        st.warning(
-            "Phase 2 will be skipped — tick at least one of Email or Instagram."
-        )
+        st.caption("🌐 Scraping all channels (email + all socials).")
     enrich_workers = st.slider(
         "Parallel website fetches",
         min_value=1,
@@ -427,11 +458,16 @@ with st.sidebar:
         disabled=not enrich_websites,
     )
 
-    # Build the channels dict the enricher consumes.
-    enrich_channels = {
-        "email": bool(scrape_email),
-        "instagram": bool(scrape_instagram),
-    }
+    # Build the channels dict. If the user ticks at least one box we honor it
+    # as a filter; if both are unticked we fall back to legacy behavior (all
+    # channels) by passing channels=None to the enricher.
+    if scrape_email or scrape_instagram:
+        enrich_channels = {
+            "email": bool(scrape_email),
+            "instagram": bool(scrape_instagram),
+        }
+    else:
+        enrich_channels = None  # None = scrape everything
 
     st.markdown("---")
     run = st.button("▶️ Start scraping", type="primary", use_container_width=True)
@@ -492,12 +528,14 @@ if run:
     st.session_state.phase1_done = True
 
     # ---- Phase 2 -----------------------------------------------------------
-    any_channel = any(enrich_channels.values())
-    if enrich_websites and results and any_channel:
+    if enrich_websites and results:
         with_site = sum(1 for r in results if r.get("website"))
-        channels_label = ", ".join(
-            name.capitalize() for name, on in enrich_channels.items() if on
-        )
+        if enrich_channels is None:
+            channels_label = "All (email + all socials)"
+        else:
+            channels_label = ", ".join(
+                name.capitalize() for name, on in enrich_channels.items() if on
+            )
         st.markdown("### Phase 2 — Enriching websites")
         st.caption(
             f"{with_site} of {len(results)} places have a website to enrich. "
@@ -558,6 +596,20 @@ if run:
                 )
             else:
                 st.info("No website duplicates found.")
+
+        # Step 3: channel filter. If the user picked specific channels
+        # (e.g. Instagram), drop rows that don't have that channel filled.
+        before_filter = len(results)
+        results, filtered_out = filter_by_channels(results, enrich_channels)
+        if filtered_out > 0:
+            active_names = ", ".join(
+                k.capitalize() for k, v in (enrich_channels or {}).items() if v
+            )
+            st.success(
+                f"🎯 Channel filter ({active_names}): kept {len(results)} of "
+                f"{before_filter} rows (dropped {filtered_out} without the "
+                f"selected channel)."
+            )
 
         st.session_state.results = results
 
