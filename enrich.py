@@ -151,8 +151,20 @@ def _fetch(client: httpx.Client, url: str) -> str | None:
         return None
 
 
-def enrich_website(url: str, max_pages: int = 3) -> dict:
-    """Return dict with `emails` (list[str]) and `socials` (dict[platform, list[str]])."""
+def enrich_website(
+    url: str,
+    max_pages: int = 3,
+    client: httpx.Client | None = None,
+    need_email: bool = True,
+) -> dict:
+    """Return dict with `emails` (list[str]) and `socials` (dict[platform, list[str]]).
+
+    client: reuse a shared httpx.Client for connection pooling. If None, a
+        per-call client is created (slower).
+    need_email: when False (e.g. only socials are wanted), skip the contact /
+        about pages — socials are almost always on the homepage. Drops Phase 2
+        per-site latency by ~3×.
+    """
     result = {"emails": [], "socials": {}}
     url = _normalize_url(url)
     if not url:
@@ -162,24 +174,30 @@ def enrich_website(url: str, max_pages: int = 3) -> dict:
     base = f"{parsed.scheme}://{parsed.netloc}"
 
     pages: list[str] = [url]
-    for path in CONTACT_PATHS:
-        if len(pages) >= max_pages:
-            break
-        pages.append(urljoin(base, path))
+    if need_email:
+        for path in CONTACT_PATHS:
+            if len(pages) >= max_pages:
+                break
+            pages.append(urljoin(base, path))
+    # else: homepage-only (socials only)
 
     all_html_parts: list[str] = []
-    combined_soup = BeautifulSoup("", "lxml")
 
-    with httpx.Client(headers=HEADERS, http2=False) as client:
+    own_client = client is None
+    c = client or httpx.Client(headers=HEADERS, http2=False)
+    try:
         fetched = 0
         for p in pages:
             if fetched >= max_pages:
                 break
-            html = _fetch(client, p)
+            html = _fetch(c, p)
             if html is None:
                 continue
             fetched += 1
             all_html_parts.append(html)
+    finally:
+        if own_client:
+            c.close()
 
     if not all_html_parts:
         return result
@@ -187,7 +205,8 @@ def enrich_website(url: str, max_pages: int = 3) -> dict:
     combined_html = "\n".join(all_html_parts)
     combined_soup = BeautifulSoup(combined_html, "lxml")
 
-    result["emails"] = _extract_emails(combined_html)
+    if need_email:
+        result["emails"] = _extract_emails(combined_html)
     result["socials"] = _extract_socials(combined_soup)
     return result
 
@@ -267,20 +286,42 @@ def enrich_places_batch(
     if not todo:
         return
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(enrich_website, site, max_pages_per_site): idx
-            for idx, site in todo
-        }
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                enrichment = fut.result()
-            except Exception as e:
-                places[idx]["enrichment_error"] = str(e)
-                enrichment = {"emails": [], "socials": {}}
-            _apply_enrichment(places[idx], enrichment, channels)
-            done += 1
-            if progress_cb:
-                progress_cb(done, total)
-            yield idx, places[idx]
+    # Smart page count: when email is NOT requested, skip contact/about pages.
+    need_email = write_all or (channels or {}).get("email", False)
+
+    # One shared httpx client across all worker threads → keep-alive + pooling.
+    shared_client = httpx.Client(
+        headers=HEADERS,
+        http2=False,
+        limits=httpx.Limits(
+            max_keepalive_connections=max_workers * 2,
+            max_connections=max_workers * 4,
+        ),
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    enrich_website,
+                    site,
+                    max_pages_per_site,
+                    shared_client,
+                    need_email,
+                ): idx
+                for idx, site in todo
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    enrichment = fut.result()
+                except Exception as e:
+                    places[idx]["enrichment_error"] = str(e)
+                    enrichment = {"emails": [], "socials": {}}
+                _apply_enrichment(places[idx], enrichment, channels)
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total)
+                yield idx, places[idx]
+    finally:
+        shared_client.close()
